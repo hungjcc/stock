@@ -31,23 +31,50 @@ def insert_stock_to_db(symbol, company_name, price, timestamp, market_type):
         
         # Check if symbol already exists for the given market
         cursor.execute("""
-            SELECT COUNT(*) FROM [dbo].[test-myproject-table]
+            SELECT StockNumber FROM [dbo].[test-myproject-table]
             WHERE Symbol = ? AND MarketType = ?
         """, (symbol, market_type))
         
-        if cursor.fetchone()[0] > 0:
-            print(f"Stock {symbol} ({market_type}) already exists in database.")
-            return False
-        
-        # Insert new record
-        cursor.execute("""
-            INSERT INTO [dbo].[test-myproject-table] 
-            (Symbol, CompanyName, Price, Timestamp, MarketType)
-            VALUES (?, ?, ?, ?, ?)
-        """, (symbol, company_name, price, timestamp, market_type))
+        result = cursor.fetchone()
+        if result:
+            stock_number = result[0]
+            # Insert only into history table
+            cursor.execute("""
+                INSERT INTO StockPriceHistory 
+                (StockNumber, Symbol, CompanyName, Price, Timestamp, MarketType)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (stock_number, symbol, company_name, price, timestamp, market_type))
+            
+            # Update main table with latest price
+            cursor.execute("""
+                UPDATE [dbo].[test-myproject-table]
+                SET Price = ?, Timestamp = ?, CompanyName = ?
+                WHERE StockNumber = ?
+            """, (price, timestamp, company_name, stock_number))
+            
+            print(f"Updated price history for {symbol} ({company_name})")
+        else:
+            # Insert into main table first
+            cursor.execute("""
+                INSERT INTO [dbo].[test-myproject-table]
+                (Symbol, CompanyName, Price, Timestamp, MarketType)
+                VALUES (?, ?, ?, ?, ?)
+            """, (symbol, company_name, price, timestamp, market_type))
+            
+            # Get the newly created StockNumber
+            cursor.execute("SELECT @@IDENTITY")
+            stock_number = cursor.fetchone()[0]
+            
+            # Insert into history table
+            cursor.execute("""
+                INSERT INTO StockPriceHistory 
+                (StockNumber, Symbol, CompanyName, Price, Timestamp, MarketType)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (stock_number, symbol, company_name, price, timestamp, market_type))
+            
+            print(f"Added new stock {symbol} ({company_name})")
         
         conn.commit()
-        print(f"Added new record for {symbol} ({company_name}) - {market_type}")
         return True
         
     except Exception as e:
@@ -89,12 +116,22 @@ def update_all_stock_prices(market_type=None):
             try:
                 price, new_company_name = get_stock_price_and_name(symbol, mkt_type)
                 if price is not None:
-                    # Update the price, timestamp, and potentially the company name
+                    timestamp = datetime.now()
+                    
+                    # Insert into history table
+                    cursor.execute("""
+                        INSERT INTO StockPriceHistory 
+                        (StockNumber, Symbol, CompanyName, Price, Timestamp, MarketType)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (stock_id, symbol, new_company_name, price, timestamp, mkt_type))
+                    
+                    # Update main table
                     cursor.execute("""
                         UPDATE [dbo].[test-myproject-table]
                         SET Price = ?, Timestamp = ?, CompanyName = ?
                         WHERE StockNumber = ?
-                    """, (price, datetime.now(), new_company_name, stock_id))
+                    """, (price, timestamp, new_company_name, stock_id))
+                    
                     conn.commit()
                     updated_count += 1
                     print(f"✓ Updated {symbol} ({new_company_name}) - {mkt_type}: {price}")
@@ -111,38 +148,40 @@ def update_all_stock_prices(market_type=None):
         cursor.close()
         conn.close()
 
-def get_stock_count(market_type=None):
-    """Get the count of stocks in the database"""
+def view_price_history(symbol=None, market_type=None, limit=10):
+    """View price history for a specific stock or all stocks"""
     try:
         conn = pypyodbc.connect(conn_str)
         cursor = conn.cursor()
         
-        if market_type:
+        if symbol and market_type:
             cursor.execute("""
-                SELECT MarketType, COUNT(*) as count 
-                FROM [dbo].[test-myproject-table]
-                WHERE MarketType = ?
-                GROUP BY MarketType
-            """, (market_type,))
+                SELECT h.Symbol, h.CompanyName, h.Price, h.Timestamp, h.MarketType
+                FROM StockPriceHistory h
+                WHERE h.Symbol = ? AND h.MarketType = ?
+                ORDER BY h.Timestamp DESC
+            """, (symbol, market_type))
         else:
             cursor.execute("""
-                SELECT MarketType, COUNT(*) as count 
-                FROM [dbo].[test-myproject-table]
-                GROUP BY MarketType
-                UNION ALL
-                SELECT 'Total' as MarketType, COUNT(*) as count 
-                FROM [dbo].[test-myproject-table]
+                SELECT h.Symbol, h.CompanyName, h.Price, h.Timestamp, h.MarketType
+                FROM StockPriceHistory h
+                ORDER BY h.Timestamp DESC
             """)
         
-        results = cursor.fetchall()
-        print("\nStock Count Summary:")
-        print("-" * 30)
-        for market, count in results:
-            print(f"{market or 'Unspecified'}: {count} stocks")
-        print("-" * 30)
+        records = cursor.fetchmany(limit) if limit else cursor.fetchall()
+        
+        if not records:
+            print("No price history found.")
+            return
+        
+        print("\nPrice History:")
+        print("Symbol\tMarket\tCompany Name\tPrice\tTimestamp")
+        print("-" * 80)
+        for symbol, name, price, timestamp, mkt_type in records:
+            print(f"{symbol}\t{mkt_type}\t{name[:30]}\t${price:.2f}\t{timestamp}")
             
     except Exception as e:
-        print(f"Error getting stock count: {str(e)}")
+        print(f"Error retrieving price history: {str(e)}")
     finally:
         cursor.close()
         conn.close()
@@ -156,15 +195,19 @@ def list_all_stocks(market_type=None):
         # Get stocks, optionally filtered by market type
         if market_type:
             cursor.execute("""
-                SELECT Symbol, CompanyName, Price, Timestamp, MarketType 
-                FROM [dbo].[test-myproject-table]
+                SELECT Symbol, CompanyName, Price, Timestamp, MarketType,
+                       (SELECT COUNT(*) FROM StockPriceHistory h 
+                        WHERE h.Symbol = t.Symbol AND h.MarketType = t.MarketType) as HistoryCount
+                FROM [dbo].[test-myproject-table] t
                 WHERE MarketType = ?
                 ORDER BY Symbol
             """, (market_type,))
         else:
             cursor.execute("""
-                SELECT Symbol, CompanyName, Price, Timestamp, MarketType 
-                FROM [dbo].[test-myproject-table]
+                SELECT Symbol, CompanyName, Price, Timestamp, MarketType,
+                       (SELECT COUNT(*) FROM StockPriceHistory h 
+                        WHERE h.Symbol = t.Symbol AND h.MarketType = t.MarketType) as HistoryCount
+                FROM [dbo].[test-myproject-table] t
                 ORDER BY MarketType, Symbol
             """)
         
@@ -174,10 +217,10 @@ def list_all_stocks(market_type=None):
             return
         
         print("\nCurrent Stock List:")
-        print("Symbol\tMarket\tCompany Name\tPrice\tLast Updated")
-        print("-" * 80)
-        for symbol, name, price, timestamp, mkt_type in stocks:
-            print(f"{symbol}\t{mkt_type}\t{name[:30]}\t${price:.2f}\t{timestamp}")
+        print("Symbol\tMarket\tCompany Name\tPrice\tLast Updated\tHistory Records")
+        print("-" * 100)
+        for symbol, name, price, timestamp, mkt_type, history_count in stocks:
+            print(f"{symbol}\t{mkt_type}\t{name[:30]}\t${price:.2f}\t{timestamp}\t{history_count}")
             
     except Exception as e:
         print(f"Error accessing database: {str(e)}")
@@ -196,7 +239,7 @@ if __name__ == "__main__":
         print("6. List All Stocks")
         print("7. List HK Stocks")
         print("8. List US Stocks")
-        print("9. Show Stock Count")
+        print("9. View Price History")
         print("10. Quit")
         
         choice = input("\nEnter your choice (1-10): ").strip()
@@ -233,7 +276,24 @@ if __name__ == "__main__":
             list_all_stocks(market_type)
             
         elif choice == "9":
-            get_stock_count()
+            print("\nView Price History:")
+            print("1. View All History")
+            print("2. View Specific Stock History")
+            sub_choice = input("Enter your choice (1-2): ").strip()
+            
+            if sub_choice == "1":
+                view_price_history()
+            elif sub_choice == "2":
+                market_type = input("Enter market type (HK/US): ").strip().upper()
+                if market_type not in ["HK", "US"]:
+                    print("Invalid market type.")
+                    continue
+                symbol = input("Enter stock symbol: ").strip().upper()
+                if market_type == "HK":
+                    symbol = symbol.zfill(4)
+                view_price_history(symbol, market_type)
+            else:
+                print("Invalid choice.")
         
         else:
             print("Invalid choice. Please enter a number between 1 and 10.")
